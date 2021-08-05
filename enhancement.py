@@ -65,7 +65,6 @@ def enhancement(img, alpha):
 
     Output: enhanced image in BGR format
     """
-    #height, width, channel = img.shape
 
     D_r = img[:,:,0]
     D_g = img[:,:,1]
