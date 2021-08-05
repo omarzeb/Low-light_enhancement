@@ -1,7 +1,7 @@
 # Low-light_enhancement
 
 This is an un-official python implementation of Research Paper:
-(https://ieeexplore.ieee.org/document/7949509)
+https://ieeexplore.ieee.org/document/7949509
 
 ## Useage
 Run the enhancement.py file by giving 
