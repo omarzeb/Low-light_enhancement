@@ -1,6 +1,7 @@
 import numpy as np
 import cv2
 import time
+import sys
 
 
 def calc_mean(img_bgr):
@@ -82,10 +83,22 @@ def run_webcam(
     except Exception:
         pass
 
-    # Try V4L2 backend first on Linux, then fallback
-    cap = cv2.VideoCapture(camera_index, cv2.CAP_V4L2)
-    if not cap.isOpened():
-        cap = cv2.VideoCapture(camera_index)
+    # Select backend per platform
+    if sys.platform == "win32":
+        cap = cv2.VideoCapture(camera_index, cv2.CAP_DSHOW)
+        if not cap.isOpened():
+            cap = cv2.VideoCapture(camera_index, cv2.CAP_MSMF)
+    else:
+        cap = cv2.VideoCapture(camera_index, cv2.CAP_V4L2)
+        if not cap.isOpened():
+            cap = cv2.VideoCapture(camera_index)
+
+    # Apply preferred format on Windows first for better 1080p rates
+    if sys.platform == "win32":
+        try:
+            cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+        except Exception:
+            pass
 
     # Set capture properties
     if width > 0:
@@ -101,11 +114,12 @@ def run_webcam(
     except Exception:
         pass
 
-    # Try formats: MJPG first, then YUYV
-    try:
-        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
-    except Exception:
-        pass
+    # On non-Windows platforms, try MJPG for throughput
+    if sys.platform != "win32":
+        try:
+            cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+        except Exception:
+            pass
 
     if not cap.isOpened():
         print("Error: Cannot open camera.")
@@ -115,6 +129,20 @@ def run_webcam(
     actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     actual_fps = cap.get(cv2.CAP_PROP_FPS)
+
+    # If Windows did not apply 1080p with MJPG, try YUY2 fallback
+    if sys.platform == "win32" and (actual_w < width or actual_h < height):
+        try:
+            cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"YUY2"))
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+            if target_fps > 0:
+                cap.set(cv2.CAP_PROP_FPS, target_fps)
+            actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            actual_fps = cap.get(cv2.CAP_PROP_FPS)
+        except Exception:
+            pass
 
     window_name = "Enhanced (CPU) - Press 'q' to quit"
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
