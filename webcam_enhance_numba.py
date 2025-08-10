@@ -356,9 +356,9 @@ def run_webcam(
     except Exception:
         pass
 
-    window_name = "Enhanced (CPU/Numba) - Press 'q' to quit"
+    window_name = "Original | Enhanced (CPU/Numba) - Press 'q' to quit"
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
-    cv2.resizeWindow(window_name, min(actual_w, 1280), min(actual_h, 720))
+    cv2.resizeWindow(window_name, min(actual_w * 2, 1920), min(actual_h, 720))
 
     prev_time = time.time()
     out_buffer = None
@@ -382,7 +382,8 @@ def run_webcam(
                 (0, 0, 255),
                 2,
             )
-            cv2.imshow(window_name, placeholder)
+            combined_ph = cv2.hconcat([placeholder, placeholder])
+            cv2.imshow(window_name, combined_ph)
             if cv2.waitKey(1) & 0xFF == ord("q"):
                 break
             continue
@@ -430,17 +431,18 @@ def run_webcam(
         fps = 1.0 / max(now - prev_time, 1e-6)
         prev_time = now
         info = f"{actual_w}x{actual_h} @{actual_fps:.0f} alpha={alpha:.3f} fps={fps:.1f}"
-        cv2.putText(
-            out_buffer,
-            info,
-            (10, 30),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.7,
-            (0, 255, 0),
-            2,
-        )
 
-        cv2.imshow(window_name, out_buffer)
+        # Prepare side-by-side view: original (left) and enhanced (right)
+        orig_vis = frame_bgr.copy()
+        out_vis = out_buffer.copy()
+
+        cv2.putText(orig_vis, "Original", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+        cv2.putText(out_vis, "Enhanced", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        cv2.putText(out_vis, info, (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+
+        combined = cv2.hconcat([orig_vis, out_vis])
+
+        cv2.imshow(window_name, combined)
         frame_count += 1
 
         if cv2.waitKey(1) & 0xFF == ord("q"):
