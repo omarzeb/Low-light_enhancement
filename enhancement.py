@@ -3,15 +3,19 @@ import cv2
 import time
 
 
-def calc_mean(img_rgb):
+def calc_mean(img_bgr):
     """
-    Calculate the scalar mean luminance (normalized 0..1) as 0.299 R + 0.587 G + 0.114 B
-    Input: image in RGB
+    Calculate the scalar mean luminance (normalized 0..1) using BGR input.
+    L = 0.299 * R + 0.587 * G + 0.114 * B
 
+    Input: image in BGR (uint8)
     Output: scalar mean in [0, 1]
     """
-    img_float = img_rgb.astype(np.float32) / 255.0
-    luminance = 0.299 * img_float[:, :, 0] + 0.587 * img_float[:, :, 1] + 0.114 * img_float[:, :, 2]
+    img_float = img_bgr.astype(np.float32) / 255.0
+    B = img_float[:, :, 0]
+    G = img_float[:, :, 1]
+    R = img_float[:, :, 2]
+    luminance = 0.299 * R + 0.587 * G + 0.114 * B
     return float(luminance.mean())
 
 
@@ -28,35 +32,33 @@ def calc_alpha(p0, mean):
     return alpha
 
 
-def enhancement(img_rgb, alpha):
+def enhancement(img_bgr, alpha, out_buffer=None):
     """
-    Final enhancement as shown in equation 10 of the paper
-    Input: image in RGB
-           alpha
-
-    Output: enhanced image in BGR format
+    Enhancement using BGR input/output.
+    Uses OpenCV's convertScaleAbs for fast per-channel scaling with saturation.
     """
-    img_float = img_rgb.astype(np.float32)
+    B = img_bgr[:, :, 0]
+    G = img_bgr[:, :, 1]
+    R = img_bgr[:, :, 2]
 
-    D_r = img_float[:, :, 0]
-    D_g = img_float[:, :, 1]
-    D_b = img_float[:, :, 2]
+    max_b = float(B.max())
+    max_g = float(G.max())
+    max_r = float(R.max())
 
-    # Avoid division by zero by adding a tiny epsilon
-    max_r = float(np.max(D_r))
-    max_g = float(np.max(D_g))
-    max_b = float(np.max(D_b))
     E_r = alpha * (170.7 / (max_r + 15.49 + 1e-6))
     E_g = alpha * (179.3 / (max_g + 15.42 + 1e-6))
     E_b = alpha * (160.4 / (max_b + 15.81 + 1e-6))
 
-    R = D_r * E_r
-    G = D_g * E_g
-    B = D_b * E_b
+    if out_buffer is None or out_buffer.shape != img_bgr.shape:
+        out = np.empty_like(img_bgr)
+    else:
+        out = out_buffer
 
-    enhanced_bgr = np.dstack([B, G, R])
-    enhanced_bgr = np.clip(enhanced_bgr, 0, 255).astype(np.uint8)
-    return enhanced_bgr
+    out[:, :, 0] = cv2.convertScaleAbs(B, alpha=E_b, beta=0)
+    out[:, :, 1] = cv2.convertScaleAbs(G, alpha=E_g, beta=0)
+    out[:, :, 2] = cv2.convertScaleAbs(R, alpha=E_r, beta=0)
+
+    return out
 
 
 def run_webcam(
@@ -66,8 +68,20 @@ def run_webcam(
     height: int = 1080,
     target_fps: int = 30,
     fast_mean: bool = True,
-    mean_downsample: int = 4,
+    mean_downsample: int = 8,
+    alpha_update_interval: int = 3,
 ):
+    # Enable OpenCV optimizations and threads if available
+    try:
+        cv2.setUseOptimized(True)
+    except Exception:
+        pass
+    try:
+        nthreads = max(1, cv2.getNumberOfCPUs())
+        cv2.setNumThreads(nthreads)
+    except Exception:
+        pass
+
     # Try V4L2 backend first on Linux, then fallback
     cap = cv2.VideoCapture(camera_index, cv2.CAP_V4L2)
     if not cap.isOpened():
@@ -87,7 +101,7 @@ def run_webcam(
     except Exception:
         pass
 
-    # Prefer MJPG for better throughput if available
+    # Try formats: MJPG first, then YUYV
     try:
         cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
     except Exception:
@@ -107,6 +121,9 @@ def run_webcam(
     cv2.resizeWindow(window_name, min(actual_w, 1280), min(actual_h, 720))
 
     prev_time = time.time()
+    out_buffer = None
+    alpha = 1.0
+    frame_count = 0
 
     while True:
         ret, frame_bgr = cap.read()
@@ -118,29 +135,30 @@ def run_webcam(
                 break
             continue
 
-        frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+        # Compute alpha at a lower cadence to reduce CPU
+        if frame_count % alpha_update_interval == 0:
+            if fast_mean and mean_downsample > 1:
+                small = cv2.resize(
+                    frame_bgr,
+                    (max(1, frame_bgr.shape[1] // mean_downsample), max(1, frame_bgr.shape[0] // mean_downsample)),
+                    interpolation=cv2.INTER_AREA,
+                )
+                mean_value = calc_mean(small)
+            else:
+                mean_value = calc_mean(frame_bgr)
+            alpha = calc_alpha(p0, mean_value)
 
-        if fast_mean and mean_downsample > 1:
-            small = cv2.resize(
-                frame_rgb,
-                (max(1, frame_rgb.shape[1] // mean_downsample), max(1, frame_rgb.shape[0] // mean_downsample)),
-                interpolation=cv2.INTER_AREA,
-            )
-            mean_value = calc_mean(small)
-        else:
-            mean_value = calc_mean(frame_rgb)
-
-        alpha = calc_alpha(p0, mean_value)
-        enhanced_bgr = enhancement(frame_rgb, alpha)
+        out_buffer = enhancement(frame_bgr, alpha, out_buffer)
 
         # Overlay quick diagnostics
         now = time.time()
         fps = 1.0 / max(now - prev_time, 1e-6)
         prev_time = now
         info = f"{actual_w}x{actual_h} @{actual_fps:.0f} req:{width}x{height}@{target_fps} alpha={alpha:.3f} fps={fps:.1f}"
-        cv2.putText(enhanced_bgr, info, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        cv2.putText(out_buffer, info, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
 
-        cv2.imshow(window_name, enhanced_bgr)
+        cv2.imshow(window_name, out_buffer)
+        frame_count += 1
         if cv2.waitKey(1) & 0xFF == ord('q'):
             break
 
