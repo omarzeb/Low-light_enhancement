@@ -1,15 +1,16 @@
 import numpy as np
 import cv2
+import time
 
 
 def calc_mean(img_rgb):
     """
-    Calculate the scalar mean luminance as defined by 0.299 R + 0.587 G + 0.114 B
+    Calculate the scalar mean luminance (normalized 0..1) as 0.299 R + 0.587 G + 0.114 B
     Input: image in RGB
 
-    Output: scalar mean
+    Output: scalar mean in [0, 1]
     """
-    img_float = img_rgb.astype(np.float32)
+    img_float = img_rgb.astype(np.float32) / 255.0
     luminance = 0.299 * img_float[:, :, 0] + 0.587 * img_float[:, :, 1] + 0.114 * img_float[:, :, 2]
     return float(luminance.mean())
 
@@ -41,9 +42,13 @@ def enhancement(img_rgb, alpha):
     D_g = img_float[:, :, 1]
     D_b = img_float[:, :, 2]
 
-    E_r = alpha * (170.7 / (float(np.max(D_r)) + 15.49))
-    E_g = alpha * (179.3 / (float(np.max(D_g)) + 15.42))
-    E_b = alpha * (160.4 / (float(np.max(D_b)) + 15.81))
+    # Avoid division by zero by adding a tiny epsilon
+    max_r = float(np.max(D_r))
+    max_g = float(np.max(D_g))
+    max_b = float(np.max(D_b))
+    E_r = alpha * (170.7 / (max_r + 15.49 + 1e-6))
+    E_g = alpha * (179.3 / (max_g + 15.42 + 1e-6))
+    E_b = alpha * (160.4 / (max_b + 15.81 + 1e-6))
 
     R = D_r * E_r
     G = D_g * E_g
@@ -55,11 +60,22 @@ def enhancement(img_rgb, alpha):
 
 
 def run_webcam(camera_index: int = 0, p0: float = 1.6, width: int = 640, height: int = 480):
-    cap = cv2.VideoCapture(camera_index)
+    # Try V4L2 backend first on Linux, then fallback
+    cap = cv2.VideoCapture(camera_index, cv2.CAP_V4L2)
+    if not cap.isOpened():
+        cap = cv2.VideoCapture(camera_index)
+
+    # Set capture properties
     if width > 0:
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
     if height > 0:
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+
+    # Prefer MJPG for better throughput if available
+    try:
+        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
+    except Exception:
+        pass
 
     if not cap.isOpened():
         print("Error: Cannot open camera.")
@@ -68,16 +84,30 @@ def run_webcam(camera_index: int = 0, p0: float = 1.6, width: int = 640, height:
     window_name = "Enhanced (CPU) - Press 'q' to quit"
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
 
+    prev_time = time.time()
+
     while True:
         ret, frame_bgr = cap.read()
-        if not ret:
-            break
+        if not ret or frame_bgr is None or frame_bgr.size == 0:
+            # Show a placeholder frame with message to avoid blank window
+            placeholder = np.zeros((height if height > 0 else 480, width if width > 0 else 640, 3), dtype=np.uint8)
+            cv2.putText(placeholder, "No frame from camera", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2)
+            cv2.imshow(window_name, placeholder)
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                break
+            continue
 
         frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
 
         mean_value = calc_mean(frame_rgb)
         alpha = calc_alpha(p0, mean_value)
         enhanced_bgr = enhancement(frame_rgb, alpha)
+
+        # Overlay quick diagnostics
+        now = time.time()
+        fps = 1.0 / max(now - prev_time, 1e-6)
+        prev_time = now
+        cv2.putText(enhanced_bgr, f"alpha={alpha:.3f} fps={fps:.1f}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
 
         cv2.imshow(window_name, enhanced_bgr)
         if cv2.waitKey(1) & 0xFF == ord('q'):
