@@ -33,22 +33,32 @@ def calc_alpha(p0, mean):
     return alpha
 
 
-def enhancement(img_bgr, alpha, out_buffer=None):
+def enhancement(img_bgr, alpha, out_buffer=None, prev_scales=None, gain_smooth: float = 0.85, percentile: float = 99.5):
     """
-    Enhancement using BGR input/output.
-    Uses OpenCV's convertScaleAbs for fast per-channel scaling with saturation.
+    Enhancement using robust percentiles and temporally smoothed per-channel gains.
+    Input: BGR frame, scalar alpha, optional output buffer and previous scales.
+    Returns: enhanced frame and current smoothed scales as a tuple (E_b, E_g, E_r).
     """
     B = img_bgr[:, :, 0]
     G = img_bgr[:, :, 1]
     R = img_bgr[:, :, 2]
 
-    max_b = float(B.max())
-    max_g = float(G.max())
-    max_r = float(R.max())
+    eps = 1e-6
+    vb = float(np.percentile(B, percentile))
+    vg = float(np.percentile(G, percentile))
+    vr = float(np.percentile(R, percentile))
 
-    E_r = alpha * (170.7 / (max_r + 15.49 + 1e-6))
-    E_g = alpha * (179.3 / (max_g + 15.42 + 1e-6))
-    E_b = alpha * (160.4 / (max_b + 15.81 + 1e-6))
+    E_r_curr = alpha * (170.7 / (vr + 15.49 + eps))
+    E_g_curr = alpha * (179.3 / (vg + 15.42 + eps))
+    E_b_curr = alpha * (160.4 / (vb + 15.81 + eps))
+
+    if prev_scales is None:
+        E_b, E_g, E_r = E_b_curr, E_g_curr, E_r_curr
+    else:
+        s = float(np.clip(gain_smooth, 0.0, 0.999))
+        E_b = s * prev_scales[0] + (1.0 - s) * E_b_curr
+        E_g = s * prev_scales[1] + (1.0 - s) * E_g_curr
+        E_r = s * prev_scales[2] + (1.0 - s) * E_r_curr
 
     if out_buffer is None or out_buffer.shape != img_bgr.shape:
         out = np.empty_like(img_bgr)
@@ -59,7 +69,7 @@ def enhancement(img_bgr, alpha, out_buffer=None):
     out[:, :, 1] = cv2.convertScaleAbs(G, alpha=E_g, beta=0)
     out[:, :, 2] = cv2.convertScaleAbs(R, alpha=E_r, beta=0)
 
-    return out
+    return out, (E_b, E_g, E_r)
 
 
 def run_webcam(
@@ -71,8 +81,16 @@ def run_webcam(
     fast_mean: bool = True,
     mean_downsample: int = 8,
     alpha_update_interval: int = 3,
+    alpha_smooth: float = 0.9,
+    alpha_min: float = 0.8,
+    alpha_max: float = 2.5,
+    gain_smooth: float = 0.85,
+    gain_percentile: float = 99.5,
+    stats_blur: bool = True,
+    stats_blur_sigma: float = 1.0,
+    lock_auto_exposure: bool = False,
+    manual_exposure: float = -5.0,
 ):
-    # Enable OpenCV optimizations and threads if available
     try:
         cv2.setUseOptimized(True)
     except Exception:
@@ -83,7 +101,6 @@ def run_webcam(
     except Exception:
         pass
 
-    # Select backend per platform
     if sys.platform == "win32":
         cap = cv2.VideoCapture(camera_index, cv2.CAP_DSHOW)
         if not cap.isOpened():
@@ -93,14 +110,12 @@ def run_webcam(
         if not cap.isOpened():
             cap = cv2.VideoCapture(camera_index)
 
-    # Apply preferred format on Windows first for better 1080p rates
     if sys.platform == "win32":
         try:
             cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
         except Exception:
             pass
 
-    # Set capture properties
     if width > 0:
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
     if height > 0:
@@ -108,13 +123,11 @@ def run_webcam(
     if target_fps > 0:
         cap.set(cv2.CAP_PROP_FPS, target_fps)
 
-    # Reduce latency if supported
     try:
         cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
     except Exception:
         pass
 
-    # On non-Windows platforms, try MJPG for throughput
     if sys.platform != "win32":
         try:
             cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
@@ -125,12 +138,17 @@ def run_webcam(
         print("Error: Cannot open camera.")
         return
 
-    # Read back actual settings
+    if sys.platform == "win32" and lock_auto_exposure:
+        try:
+            cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25)
+            cap.set(cv2.CAP_PROP_EXPOSURE, float(manual_exposure))
+        except Exception:
+            pass
+
     actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     actual_fps = cap.get(cv2.CAP_PROP_FPS)
 
-    # If Windows did not apply 1080p with MJPG, try YUY2 fallback
     if sys.platform == "win32" and (actual_w < width or actual_h < height):
         try:
             cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"YUY2"))
@@ -150,6 +168,8 @@ def run_webcam(
 
     prev_time = time.time()
     out_buffer = None
+    prev_scales = None
+    prev_alpha = None
     alpha = 1.0
     frame_count = 0
 
@@ -163,7 +183,6 @@ def run_webcam(
                 break
             continue
 
-        # Compute alpha at a lower cadence to reduce CPU
         if frame_count % alpha_update_interval == 0:
             if fast_mean and mean_downsample > 1:
                 small = cv2.resize(
@@ -171,18 +190,33 @@ def run_webcam(
                     (max(1, frame_bgr.shape[1] // mean_downsample), max(1, frame_bgr.shape[0] // mean_downsample)),
                     interpolation=cv2.INTER_AREA,
                 )
-                mean_value = calc_mean(small)
             else:
-                mean_value = calc_mean(frame_bgr)
-            alpha = calc_alpha(p0, mean_value)
+                small = frame_bgr
+            if stats_blur and stats_blur_sigma > 0:
+                small = cv2.GaussianBlur(small, (0, 0), stats_blur_sigma)
+            mean_value = calc_mean(small)
+            alpha_raw = calc_alpha(p0, mean_value)
+            alpha_raw = float(np.clip(alpha_raw, alpha_min, alpha_max))
+            if prev_alpha is None:
+                alpha = alpha_raw
+            else:
+                s = float(np.clip(alpha_smooth, 0.0, 0.999))
+                alpha = s * prev_alpha + (1.0 - s) * alpha_raw
+            prev_alpha = alpha
 
-        out_buffer = enhancement(frame_bgr, alpha, out_buffer)
+        out_buffer, prev_scales = enhancement(
+            frame_bgr,
+            alpha,
+            out_buffer=out_buffer,
+            prev_scales=prev_scales,
+            gain_smooth=gain_smooth,
+            percentile=gain_percentile,
+        )
 
-        # Overlay quick diagnostics
         now = time.time()
         fps = 1.0 / max(now - prev_time, 1e-6)
         prev_time = now
-        info = f"{actual_w}x{actual_h} @{actual_fps:.0f} req:{width}x{height}@{target_fps} alpha={alpha:.3f} fps={fps:.1f}"
+        info = f"{actual_w}x{actual_h} @{actual_fps:.0f} alpha={alpha:.3f} fps={fps:.1f}"
         cv2.putText(out_buffer, info, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
 
         cv2.imshow(window_name, out_buffer)
